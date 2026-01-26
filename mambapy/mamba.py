@@ -95,6 +95,20 @@ class Mamba(nn.Module):
             x, caches[i] = layer.step(x, caches[i])
 
         return x, caches
+    
+    def chunk_step(self, x_seq, caches):
+        # x_seq : (B, L, D)
+        # caches : [cache(layer) for all layers], cache : (h, inputs)
+                # h : (B, ED, N)
+                # inputs: (B, ED, d_conv-1)
+        
+        # y_seq : (B, L, D)
+        # caches : [cache(layer) for all layers], cache : (h, inputs)
+        
+        for i, layer in enumerate(self.layers):
+            x_seq, caches[i] = layer.chunk_step(x_seq, caches[i])
+        
+        return x_seq, caches
 
 class ResidualBlock(nn.Module):
     def __init__(self, config: MambaConfig):
@@ -123,6 +137,19 @@ class ResidualBlock(nn.Module):
         output, cache = self.mixer.step(self.norm(x), cache)
         output = output + x
         return output, cache
+    
+    def chunk_step(self, x_seq, cache):
+        # x_seq : (B, L, D)
+        # cache : (h, inputs)
+                # h : (B, ED, N)
+                # inputs : (B, ED, d_conv-1)
+        
+        # y_seq : (B, L, D)
+        # cache : (h, inputs)
+        
+        y_seq, cache = self.mixer.chunk_step(self.norm(x_seq), cache)
+        y_seq = y_seq + x_seq
+        return y_seq, cache
 
 class MambaBlock(nn.Module):
     def __init__(self, config: MambaConfig):
@@ -412,6 +439,76 @@ class MambaBlock(nn.Module):
         y = y + D * x
 
         return y, h
+
+    def chunk_step(self, x_seq, cache):
+        # x_seq : (B, L, D)
+        # cache : (h0, inputs)
+                # h0 : (B, ED, N)
+                # inputs : (B, ED, d_conv-1)
+        #
+        # y_seq : (B, L, D)
+        # cache : (h_T, inputs_last)
+        B, L, _ = x_seq.shape
+        h0, inputs = cache
+        
+        xz = self.in_proj(x_seq) # (B, L, 2*ED)
+        x_pre, z = xz.chunk(2, dim=-1) # (B, L, ED), (B, L, ED)
+
+        k = max(self.config.d_conv - 1, 0)
+        if k > 0:
+            x_cat = torch.cat([inputs, x_pre.transpose(1, 2)], dim=2) # (B, ED, k+L)
+            x_conv_full = self.conv1d(x_cat) # (B, ED, k+L)
+            x_conv = x_conv_full[:, :, k:k+L]
+            x_act = F.silu(x_conv.transpose(1, 2)) # (B, L, ED)
+        else:
+            x_act = self.conv1d(x_pre.transpose(1, 2))[:, :, :L]
+            x_act = F.silu(x_act.transpose(1, 2)) # (B, L, ED)
+
+        y_seq, hs = self.ssm_chunk_step(x_act, h0=h0)
+
+        z = F.silu(z) # (B, L, ED)
+        y_seq = self.out_proj(y_seq * z) # (B, L, D)
+
+        h_T = hs[:, -1] # (B, ED, N)
+        if k > 0:
+            pre_full = torch.cat([inputs.transpose(1, 2), x_pre], dim=1) # (B, k+L, ED)
+            inputs_last = pre_full[:, -k:, :].transpose(1, 2).contiguous() # (B, ED, k)
+        else:
+            inputs_last = torch.zeros(B, self.config.d_inner, 0, device=x_seq.device, dtype=x_seq.dtype)
+        
+        return y_seq, (h_T, inputs_last)
+    
+
+    def ssm_chunk_step(self, x, h0=None):
+        # x : (B, L, ED)  (after convolution + activation)
+        # h0 : (B, ED, N) or None
+        #
+        # y : (B, L, ED)
+        # hs : (B, L, ED, N)
+        A = -torch.exp(self.A_log.float()) # (ED, N)
+        D = self.D.float()
+        
+        deltaBC = self.x_proj(x) # (B, L, dt_rank + 2*N)
+        delta, B, C = torch.split(deltaBC, [self.config.dt_rank, self.config.d_state, self.config.d_state], dim=-1)
+        delta, B, C = self._apply_layernorms(delta, B, C)
+        
+        delta = self.dt_proj.weight @ delta.transpose(1, 2) # (ED, dt_rank) @ (B, L, dt_rank) -> (B, ED, L)
+        delta = delta.transpose(1, 2) # (B, L, ED)
+        delta = F.softplus(delta + self.dt_proj.bias) # (B, L, ED)
+        
+        deltaA = torch.exp(delta.unsqueeze(-1) * A) # (B, L, ED, N)
+        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2) # (B, L, ED, N)
+        BX = deltaB * x.unsqueeze(-1) # (B, L, ED, N)
+        
+        if h0 is not None:
+            BX[:, 0] = BX[:, 0] + deltaA[:, 0] * h0 # incorporate initial state
+        
+        hs = pscan(deltaA, BX) # (B, L, ED, N)
+        
+        y = (hs @ C.unsqueeze(-1)).squeeze(3) # (B, L, ED)
+        y = y + D * x
+        
+        return y, hs
 
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, use_mup: bool = False):
